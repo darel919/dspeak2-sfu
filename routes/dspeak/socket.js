@@ -30,7 +30,6 @@ function dspeakWebSocketHandler(ws) {
         type: 'test',
         data: { message: 'dspeak socket connection successful' }
     }));
-    console.log('Client connected to dspeak-v2 WebSocket');
 
     ws.on('message', async (message) => {
         let data;
@@ -48,7 +47,7 @@ function dspeakWebSocketHandler(ws) {
             }
             if (!data || typeof data.type !== 'string') {
                 ws.send(JSON.stringify({ type: 'error', data: 'Invalid message format: missing type' }));
-                console.log('Invalid message format:', data);
+                // ...existing code...
                 return;
             }
             switch (data.type) {
@@ -69,14 +68,25 @@ function dspeakWebSocketHandler(ws) {
                     });
                     transports.set(ws, transport);
                     ws.send(JSON.stringify({
-                        type: 'transport-created',
+                        type: 'transport-params',
                         data: {
                             id: transport.id,
                             iceParameters: transport.iceParameters,
                             iceCandidates: transport.iceCandidates,
                             dtlsParameters: transport.dtlsParameters,
+                            sctpParameters: transport.sctpParameters || undefined
                         }
                     }));
+                    break;
+                }
+                case 'get-rtp-capabilities': {
+                    if (!router) {
+                        ws.send(JSON.stringify({ type: 'error', data: 'Router not ready' }));
+                        break;
+                    }
+                    const rtpCaps = JSON.parse(JSON.stringify(router.rtpCapabilities));
+                    console.log('Sending RTP Capabilities:', rtpCaps);
+                    ws.send(JSON.stringify({ type: 'rtp-capabilities', data: rtpCaps }));
                     break;
                 }
                 case 'connect-transport': {
@@ -99,7 +109,7 @@ function dspeakWebSocketHandler(ws) {
                     const { kind, rtpParameters } = data.data;
                     const producer = await transport.produce({ kind, rtpParameters });
                     producers.set(ws, producer);
-                    ws.send(JSON.stringify({ type: 'produced', data: { id: producer.id } }));
+                    ws.send(JSON.stringify({ type: 'producer-id', data: { id: producer.id } }));
                     break;
                 }
                 case 'consume': {
@@ -126,7 +136,7 @@ function dspeakWebSocketHandler(ws) {
                     });
                     consumers.set(ws, consumer);
                     ws.send(JSON.stringify({
-                        type: 'consumed',
+                        type: 'consumer-params',
                         data: {
                             id: consumer.id,
                             producerId: producer.id,
@@ -138,11 +148,9 @@ function dspeakWebSocketHandler(ws) {
                 }
                 default:
                     ws.send(JSON.stringify({ type: 'error', data: `Unknown message type: ${data.type}` }));
-                    console.log('Unknown message type:', data.type);
             }
         } catch (error) {
             ws.send(JSON.stringify({ type: 'error', data: 'Error parsing message' }));
-            console.error('Error parsing WebSocket message:', error);
         }
     });
 
@@ -163,7 +171,6 @@ function dspeakWebSocketHandler(ws) {
             consumer.close();
             consumers.delete(ws);
         }
-        console.log('Client disconnected from dspeak-v2 WebSocket');
     });
 }
 

@@ -1,7 +1,7 @@
 # dspeak Backend Handler
 This is a repository for [dspeak,](https://github.com/darel919/dspeak2 "dspeak") peer-to-peer application backend. This backend will handle room creation, SFUs, Sockets, etc.
 
-This document explains the implementation and usage of the MediaSoup-powered WebSocket handler in `dspeak/socket.ts`.
+This document explains the implementation and usage of the MediaSoup-powered WebSocket handler in `dspeak/socket.js`.
 
 ## Overview
 The handler enables real-time audio communication using MediaSoup. It manages WebSocket connections, MediaSoup worker/router initialization, and WebRTC transport creation for clients.
@@ -19,7 +19,6 @@ The handler enables real-time audio communication using MediaSoup. It manages We
 
 ### 3. Message Handling
 - `ping`: Replies with a `pong` and timestamp.
-- `broadcast`: Forwards a message to all other clients.
 - `create-transport`: Creates a MediaSoup WebRTC transport for the client.
   - Uses `listenIps` with dynamic `announcedIp`:
     - Production: `api.darelisme.my.id`
