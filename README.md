@@ -1,4 +1,5 @@
-# dspeak Backend - MediaSoup WebSocket Handler
+# dspeak Backend Handler
+This is a repository for [dspeak,](https://github.com/darel919/dspeak2 "dspeak") peer-to-peer application backend. This backend will handle room creation, SFUs, Sockets, etc.
 
 This document explains the implementation and usage of the MediaSoup-powered WebSocket handler in `dspeak/socket.ts`.
 
