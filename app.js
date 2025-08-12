@@ -4,6 +4,10 @@ import { WebSocketServer } from 'ws';
 import dspeakRoutes from './routes/dspeak/index.js';
 import { dspeakWebSocketHandler } from './routes/dspeak/socket.js';
 
+import dotenv from 'dotenv';
+const envFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development';
+dotenv.config({ path: envFile });
+
 const app = express();
 const port = process.env.PORT || 8425;
 
@@ -17,4 +21,5 @@ wss.on('connection', dspeakWebSocketHandler);
 server.listen(port, () => {
   console.log(`Server is running on http://localhost:${port}`);
   console.log(`WebSocket server listening on ws://localhost:${port}/socket`);
+  // console.log(process.env.INTEROP_API_BASE_URL);
 });

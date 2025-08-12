@@ -1,7 +1,45 @@
 # dspeak Backend Handler
-This is a repository for [dspeak,](https://github.com/darel919/dspeak2 "dspeak") peer-to-peer application backend. This backend will handle room creation, SFUs, Sockets, etc.
+This is a repository for [dspeak,](https://github.com/darel919/dspeak2 "dspeak") peer-to-peer application backend. This backend will handle SFUs.
 
-This document explains the implementation and usage of the MediaSoup-powered WebSocket handler in `dspeak/socket.js`.
+
+This backend now supports robust SFU <-> main server interop via a dedicated WebSocket channel (`/dspeak/interop`).
+
+## SFU <-> Main Server Interop
+
+- Real-time events (media presence, channel sync, control) are exchanged between the SFU and main server using a persistent WebSocket connection.
+- All interop messages are JSON objects with a `type` field for routing.
+
+### Message Types
+
+- `media_presence`: User joins/leaves a media channel or starts/stops producing media.
+  - Example:
+    ```json
+    {
+      "type": "media_presence",
+      "event": "join" | "leave" | "start_produce" | "stop_produce",
+      "userId": "USER_ID",
+      "channelId": "CHANNEL_ID",
+      "timestamp": "2025-08-12T12:34:56.789Z"
+    }
+    ```
+- `channel_presence_sync`: Sync the full list of users currently active in a media channel.
+- `sfu_status`: Notify main server of SFU status or errors.
+- `force_disconnect`: Main server instructs SFU to disconnect a user from a channel (e.g., banned, kicked).
+
+### Error Handling
+
+- All malformed or invalid messages are ignored or responded to with a clear error message.
+- If a message cannot be parsed as JSON, the SFU logs a warning and ignores it.
+- If a required field is missing (e.g., `type`), the SFU responds with `{ "type": "error", "data": "Invalid message format: missing type" }`.
+- For unsupported or unknown message types, the SFU responds with `{ "type": "error", "data": "Unknown message type: ..." }`.
+- For all SFU actions (transport, produce, consume, etc.), errors are returned as `{ "type": "error", "data": "..." }` with a clear reason.
+- Interop WebSocket network errors are logged and the client will auto-reconnect.
+
+### Control Event Handling
+
+- The SFU listens for control events (e.g., `force_disconnect`) from the main server.
+- On receiving a `force_disconnect` event, the SFU disconnects the specified user from the specified channel and notifies them with a reason.
+
 
 ## Overview
 The handler enables real-time audio communication using MediaSoup. It manages WebSocket connections, MediaSoup worker/router initialization, and WebRTC transport creation for clients.

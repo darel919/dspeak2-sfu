@@ -2,6 +2,7 @@ import express from 'express'
 const router = express.Router();
 
 router.get('/health', (req, res) => {
+    console.log(process.env.INTEROP_API_BASE_URL)
     res.send('dspeak v2 API is running');
 });
 
