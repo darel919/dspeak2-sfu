@@ -49,7 +49,7 @@ function sendInteropEvent(event) {
 // Per-channel presence and media maps
 const clients = new Set();
 const channelPresence = new Map(); // channelId -> Set of userIds
-const channelTransports = new Map(); // channelId -> Map<ws, transport>
+const channelTransports = new Map(); // channelId -> Map<ws, Map<transportId, transport>>
 const channelProducers = new Map(); // channelId -> Map<ws, producer>
 const channelConsumers = new Map(); // channelId -> Map<ws, consumer>
 
@@ -219,7 +219,7 @@ async function dspeakWebSocketHandler(ws, req) {
                         ws.send(JSON.stringify({ type: 'error', data: 'Router not ready' }));
                         break;
                     }
-                    const announcedIp = isProd ? 'api.darelisme.my.id' : 'localhost';
+                    const announcedIp = isProd ? 'api.darelisme.my.id' : '127.0.0.1';
                     try {
                         const transport = await router.createWebRtcTransport({
                             listenIps: [{ ip: '0.0.0.0', announcedIp }],
@@ -227,7 +227,11 @@ async function dspeakWebSocketHandler(ws, req) {
                             enableTcp: true,
                             preferUdp: true,
                         });
-                        channelTransports.get(ws.channelId).set(ws, transport);
+                        // Ensure inner maps exist
+                        if (!channelTransports.get(ws.channelId).has(ws)) {
+                            channelTransports.get(ws.channelId).set(ws, new Map());
+                        }
+                        channelTransports.get(ws.channelId).get(ws).set(transport.id, transport);
                         ws.send(JSON.stringify({
                             type: 'transport-params',
                             data: {
@@ -259,29 +263,60 @@ async function dspeakWebSocketHandler(ws, req) {
                     break;
                 }
                 case 'connect-transport': {
-                    const transport = channelTransports.get(ws.channelId).get(ws);
-                    if (!transport) {
+                    const wsTransports = channelTransports.get(ws.channelId).get(ws);
+                    if (!wsTransports || wsTransports.size === 0) {
                         ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
                         break;
                     }
                     try {
-                        const { dtlsParameters } = data.data;
-                        await transport.connect({ dtlsParameters });
-                        ws.send(JSON.stringify({ type: 'transport-connected' }));
+                        const { dtlsParameters, transportId } = data.data || {};
+                        if (transportId) {
+                            const transport = wsTransports.get(transportId);
+                            if (!transport) {
+                                ws.send(JSON.stringify({ type: 'error', data: 'Failed to connect transport' }));
+                                break;
+                            }
+                            await transport.connect({ dtlsParameters });
+                            ws.send(JSON.stringify({ type: 'transport-connected', data: { id: transport.id } }));
+                        } else {
+                            // No id given: try to connect all pending transports
+                            let connectedAny = false;
+                            for (const t of wsTransports.values()) {
+                                try {
+                                    await t.connect({ dtlsParameters });
+                                    connectedAny = true;
+                                } catch {}
+                            }
+                            if (connectedAny) {
+                                ws.send(JSON.stringify({ type: 'transport-connected' }));
+                            } else {
+                                ws.send(JSON.stringify({ type: 'error', data: 'Failed to connect transport' }));
+                            }
+                        }
                     } catch (err) {
-                        ws.send(JSON.stringify({ type: 'error', data: 'Failed to connect transport' }));
+                        console.error('[ws] connect-transport error:', err && err.message ? err.message : err);
+                        ws.send(JSON.stringify({ type: 'error', data: 'Failed to connect transport', details: err && err.message }));
                     }
                     break;
                 }
                 case 'produce': {
                     console.log(`[ws] Received 'produce' from user ${ws.userId} in channel ${ws.channelId}`);
-                    const transport = channelTransports.get(ws.channelId).get(ws);
-                    if (!transport) {
+                    const wsTransports = channelTransports.get(ws.channelId).get(ws);
+                    if (!wsTransports || wsTransports.size === 0) {
                         ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
                         break;
                     }
                     try {
-                        const { kind, rtpParameters } = data.data;
+                        const { kind, rtpParameters, transportId } = data.data;
+                        let transport = transportId ? wsTransports.get(transportId) : null;
+                        if (!transport) {
+                            // Fallback to first transport
+                            transport = Array.from(wsTransports.values())[0];
+                        }
+                        if (!transport) {
+                            ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
+                            break;
+                        }
                         const producer = await transport.produce({ kind, rtpParameters });
                         channelProducers.get(ws.channelId).set(ws, producer);
                         ws.send(JSON.stringify({ type: 'producer-id', data: { id: producer.id } }));
@@ -301,8 +336,8 @@ async function dspeakWebSocketHandler(ws, req) {
                 }
                 case 'consume': {
                     console.log(`[ws] Received 'consume' from user ${ws.userId} in channel ${ws.channelId}`);
-                    const transport = channelTransports.get(ws.channelId).get(ws);
-                    if (!transport) {
+                    const wsTransports = channelTransports.get(ws.channelId).get(ws);
+                    if (!wsTransports || wsTransports.size === 0) {
                         ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
                         break;
                     }
@@ -314,7 +349,17 @@ async function dspeakWebSocketHandler(ws, req) {
                     }
                     const [, producer] = producerEntry;
                     try {
-                        const { rtpCapabilities } = data.data;
+                        const { rtpCapabilities, transportId } = data.data;
+                        let transport = transportId ? wsTransports.get(transportId) : null;
+                        if (!transport) {
+                            // Fallback to last (most recently created) transport for consuming
+                            const vals = Array.from(wsTransports.values());
+                            transport = vals[vals.length - 1];
+                        }
+                        if (!transport) {
+                            ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
+                            break;
+                        }
                         if (!router.canConsume({ producerId: producer.id, rtpCapabilities })) {
                             ws.send(JSON.stringify({ type: 'error', data: 'Cannot consume' }));
                             break;
@@ -384,8 +429,12 @@ async function dspeakWebSocketHandler(ws, req) {
         // Clean up per-channel media
         if (channelTransports.has(ws.channelId)) {
             const tmap = channelTransports.get(ws.channelId);
-            const transport = tmap.get(ws);
-            if (transport) transport.close();
+            const wsTransports = tmap.get(ws);
+            if (wsTransports) {
+                for (const t of wsTransports.values()) {
+                    try { t.close(); } catch {}
+                }
+            }
             tmap.delete(ws);
         }
         if (channelProducers.has(ws.channelId)) {
