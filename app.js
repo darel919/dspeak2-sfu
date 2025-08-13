@@ -1,12 +1,9 @@
+import './env.js';
 import express from 'express';
 import http from 'http';
 import { WebSocketServer } from 'ws';
 import dspeakRoutes from './routes/dspeak/index.js';
 import { dspeakWebSocketHandler } from './routes/dspeak/socket.js';
-
-import dotenv from 'dotenv';
-const envFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development';
-dotenv.config({ path: envFile });
 
 const app = express();
 const port = process.env.PORT || 8425;

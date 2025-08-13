@@ -1,10 +1,17 @@
+import '../../env.js';
 import mediasoup from 'mediasoup'
-import fetch from 'node-fetch';
 import WebSocket from 'ws';
+
 // --- Interop WebSocket Client ---
 let interopWs;
+function resolveInteropWsUrl() {
+    const wsBase = process.env.INTEROP_WS_API_BASE_URL
+        || (process.env.INTEROP_API_BASE_URL ? process.env.INTEROP_API_BASE_URL.replace(/^http(s?):/i, 'ws$1:') : null);
+    return wsBase ? `${wsBase}/dspeak/interop` : null;
+}
 function connectInteropWs() {
-    const interopUrl = (process.env.INTEROP_API_BASE_URL || 'ws://localhost:328') + '/dspeak/interop';
+    const interopUrl = resolveInteropWsUrl();
+    if (!interopUrl) return;
     interopWs = new WebSocket(interopUrl);
     interopWs.on('open', () => {
         // Optionally log or send initial handshake
@@ -56,6 +63,7 @@ const channelConsumers = new Map(); // channelId -> Map<ws, consumer>
 const isProd = process.env.NODE_ENV === 'production';
 let worker;
 let router;
+let webRtcServer;
 const mediaCodecs = [
     {
         kind: 'audio',
@@ -65,14 +73,69 @@ const mediaCodecs = [
     }
 ];
 
+
 async function initMediasoup() {
     try {
         worker = await mediasoup.createWorker();
         router = await worker.createRouter({ mediaCodecs });
-        console.log('[mediasoup] Router initialized:', !!router);
+        // --- WebRtcServer setup ---
+        // Bind both IPv6 and IPv4 on the same fixed port (UDP and TCP) so clients and TURN can reach us.
+        // If dual-stack bind fails (e.g., platform limitations), fall back to a single family.
+        const port = parseInt(process.env.SFU_PORT, 10) || undefined;
+        const announcedIpV4 = (process.env.SFU_IPV4 || '').trim();
+        const announcedIpV6 = (process.env.SFU_IPV6 || '').trim();
+        const preferredFamily = (process.env.SFU_PREFERRED_FAMILY).toLowerCase() || undefined;
+
+        const buildDualStackListenInfos = () => {
+            const infos = [];
+            if (announcedIpV6) {
+                infos.push({ protocol: 'udp', ip: '::', port, announcedIp: announcedIpV6 });
+                infos.push({ protocol: 'tcp', ip: '::', port, announcedIp: announcedIpV6 });
+            }
+            if (announcedIpV4) {
+                infos.push({ protocol: 'udp', ip: '0.0.0.0', port, announcedIp: announcedIpV4 });
+                infos.push({ protocol: 'tcp', ip: '0.0.0.0', port, announcedIp: announcedIpV4 });
+            }
+            if (!announcedIpV4 && !announcedIpV6) {
+                infos.push({ protocol: 'udp', ip: '0.0.0.0', port });
+                infos.push({ protocol: 'tcp', ip: '0.0.0.0', port });
+            }
+            return infos;
+        };
+
+        const buildSingleFamilyFallback = () => {
+            if (preferredFamily === 'ipv6' && announcedIpV6) {
+                return [
+                    { protocol: 'udp', ip: '::', port, announcedIp: announcedIpV6 },
+                    { protocol: 'tcp', ip: '::', port, announcedIp: announcedIpV6 }
+                ];
+            }
+            if (announcedIpV4) {
+                return [
+                    { protocol: 'udp', ip: '0.0.0.0', port, announcedIp: announcedIpV4 },
+                    { protocol: 'tcp', ip: '0.0.0.0', port, announcedIp: announcedIpV4 }
+                ];
+            }
+            return [
+                { protocol: 'udp', ip: '0.0.0.0', port },
+                { protocol: 'tcp', ip: '0.0.0.0', port }
+            ];
+        };
+
+        let listenInfos = buildDualStackListenInfos();
+        try {
+            webRtcServer = await worker.createWebRtcServer({ listenInfos });
+            console.log('[mediasoup] Router and WebRtcServer initialized with (dual-stack):', listenInfos);
+        } catch (bindErr) {
+            console.error('[mediasoup] Dual-stack bind failed, retrying with single family:', bindErr && bindErr.message ? bindErr.message : bindErr);
+            listenInfos = buildSingleFamilyFallback();
+            webRtcServer = await worker.createWebRtcServer({ listenInfos });
+            console.log('[mediasoup] Router and WebRtcServer initialized with (fallback):', listenInfos);
+        }
     } catch (err) {
-        console.error('[mediasoup] Failed to initialize router:', err);
+        console.error('[mediasoup] Failed to initialize router/WebRtcServer:', err);
         router = null;
+        webRtcServer = null;
     }
 }
 
@@ -106,7 +169,7 @@ async function dspeakWebSocketHandler(ws, req) {
 
     // Validate user/channel with main backend
     try {
-        const apiBase = process.env.INTEROP_API_BASE_URL || 'http://localhost:328';
+        const apiBase = process.env.INTEROP_API_BASE_URL;
         const url = `${apiBase}/dspeak/channel/details?id=${encodeURIComponent(channelId)}`;
         const resp = await fetch(url, {
             headers: { 'Authorization': userId }
@@ -215,17 +278,16 @@ async function dspeakWebSocketHandler(ws, req) {
                     ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
                     break;
                 case 'create-transport': {
-                    if (!router) {
-                        ws.send(JSON.stringify({ type: 'error', data: 'Router not ready' }));
+                    if (!router || !webRtcServer) {
+                        ws.send(JSON.stringify({ type: 'error', data: 'Router or WebRtcServer not ready' }));
                         break;
                     }
-                    const announcedIp = isProd ? 'api.darelisme.my.id' : '127.0.0.1';
                     try {
                         const transport = await router.createWebRtcTransport({
-                            listenIps: [{ ip: '0.0.0.0', announcedIp }],
+                            webRtcServer,
                             enableUdp: true,
                             enableTcp: true,
-                            preferUdp: true,
+                            preferUdp: true
                         });
                         // Ensure inner maps exist
                         if (!channelTransports.get(ws.channelId).has(ws)) {
@@ -320,9 +382,9 @@ async function dspeakWebSocketHandler(ws, req) {
                         const producer = await transport.produce({ kind, rtpParameters });
                         channelProducers.get(ws.channelId).set(ws, producer);
                         ws.send(JSON.stringify({ type: 'producer-id', data: { id: producer.id } }));
-                        // Notify all clients in channel of new producer
+                        // Notify all other clients in channel of new producer (exclude producer's own client)
                         for (const client of clients) {
-                            if (client.channelId === ws.channelId) {
+                            if (client !== ws && client.channelId === ws.channelId) {
                                 client.send(JSON.stringify({
                                     type: 'new-producer',
                                     data: { producerId: producer.id }

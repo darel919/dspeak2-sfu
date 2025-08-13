@@ -1,0 +1,22 @@
+services:
+  dspeak-be:
+    build: .
+    container_name: dspeak-be
+    environment:
+      NODE_ENV: production
+      # Configure mediasoup announced IPs and fixed UDP port
+      SFU_PORT: 12825
+      SFU_IPV4: 147.185.221.30
+      SFU_IPV6: "2001:448a:1041:c158:34cf:9616:e764:a37e"
+      SFU_PREFERRED_FAMILY: ipv6
+      # Backend base URL for interop
+      INTEROP_API_BASE_URL: "${INTEROP_API_BASE_URL:-http://api.server.drl}"
+      INTEROP_WS_API_BASE_URL: "${INTEROP_WS_API_BASE_URL:-ws://api.server.drl}"
+      PORT: 8425
+    network_mode: host
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8425/health', res=>{process.exit(res.statusCode===200?0:1)});"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

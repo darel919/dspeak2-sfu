@@ -7,14 +7,15 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "nodemon -r dotenv/config app.js"
+  "test": "echo \"Error: no test specified\" && exit 1",
+  "dev": "nodemon app.js",
+  "start": "node app.js"
   },
   "dependencies": {
-    "dotenv": "^17.2.1",
-    "express": "^5.1.0",
-    "mediasoup": "^3.18.0",
-    "ws": "^8.18.3"
+  "dotenv": "^17.2.1",
+  "express": "^5.1.0",
+  "mediasoup": "^3.18.0",
+  "ws": "^8.18.3"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"
