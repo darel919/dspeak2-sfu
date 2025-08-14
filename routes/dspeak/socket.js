@@ -81,7 +81,8 @@ const channelConsumers = new Map(); // channelId -> Map<ws, consumer>
 const isProd = process.env.NODE_ENV === 'production';
 let worker;
 let router;
-let webRtcServer;
+let webRtcServerIpv4;
+let webRtcServerIpv6;
 const mediaCodecs = [
     {
         kind: 'audio',
@@ -92,71 +93,104 @@ const mediaCodecs = [
 ];
 
 
+// Helper function to detect client IP family from WebSocket request
+function getClientIpFamily(req) {
+    // Get the real client IP, accounting for proxies
+    const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+                     req.headers['x-real-ip'] ||
+                     req.connection?.remoteAddress ||
+                     req.socket?.remoteAddress ||
+                     (req.connection?.socket ? req.connection.socket.remoteAddress : null);
+    
+    if (!clientIp) return 'ipv4'; // Default fallback
+    
+    // Remove IPv4-mapped IPv6 prefix if present
+    const cleanIp = clientIp.replace(/^::ffff:/, '');
+    
+    // Check if it's an IPv6 address
+    if (clientIp.includes(':') && !cleanIp.includes('.')) {
+        return 'ipv6';
+    }
+    
+    return 'ipv4';
+}
+
 async function initMediasoup() {
     try {
         await loadIceServers();
         worker = await mediasoup.createWorker();
         router = await worker.createRouter({ mediaCodecs });
-        // --- WebRtcServer setup ---
-        // Bind both IPv6 and IPv4 on the same fixed port (UDP and TCP) so clients and TURN can reach us.
-        // If dual-stack bind fails (e.g., platform limitations), fall back to a single family.
+        
+        // --- Separate WebRtcServer setup for IPv4 and IPv6 ---
         const port = parseInt(process.env.SFU_PORT, 10) || undefined;
+        const ipv4SourcePort = parseInt(process.env.SFU_IPV4_PORT, 10);
         const announcedIpV4 = (process.env.SFU_IPV4 || '').trim();
         const announcedIpV6 = (process.env.SFU_IPV6 || '').trim();
-        const preferredFamily = typeof process.env.SFU_PREFERRED_FAMILY === 'string' && process.env.SFU_PREFERRED_FAMILY
-            ? process.env.SFU_PREFERRED_FAMILY.toLowerCase()
-            : undefined;
 
-        const buildDualStackListenInfos = () => {
-            const infos = [];
-            if (announcedIpV6) {
-                infos.push({ protocol: 'udp', ip: '::', port, announcedIp: announcedIpV6 });
-                infos.push({ protocol: 'tcp', ip: '::', port, announcedIp: announcedIpV6 });
+        // Create IPv4-only WebRTC server
+        if (announcedIpV4) {
+            try {
+                // For playit.gg tunnel: listen on target port (SFU_PORT), announce source IP only
+                // Port correction will be handled in ICE candidate processing
+                const ipv4ListenInfos = [
+                    { protocol: 'udp', ip: '0.0.0.0', port: port, announcedAddress: announcedIpV4 },
+                    { protocol: 'tcp', ip: '0.0.0.0', port: port, announcedAddress: announcedIpV4 }
+                ];
+                webRtcServerIpv4 = await worker.createWebRtcServer({ listenInfos: ipv4ListenInfos });
+                console.log('[mediasoup] IPv4 WebRtcServer initialized:', ipv4ListenInfos);
+                console.log(`[mediasoup] Listening on local port ${port}, announcing IP ${announcedIpV4}`);
+                console.log(`[mediasoup] Port correction (${port} -> ${ipv4SourcePort}) will be applied to ICE candidates`);
+            } catch (err) {
+                console.error('[mediasoup] IPv4 WebRtcServer setup failed:', err?.message || err);
             }
-            if (announcedIpV4) {
-                infos.push({ protocol: 'udp', ip: '0.0.0.0', port, announcedIp: announcedIpV4 });
-                infos.push({ protocol: 'tcp', ip: '0.0.0.0', port, announcedIp: announcedIpV4 });
-            }
-            if (!announcedIpV4 && !announcedIpV6) {
-                infos.push({ protocol: 'udp', ip: '0.0.0.0', port });
-                infos.push({ protocol: 'tcp', ip: '0.0.0.0', port });
-            }
-            return infos;
-        };
+        }
 
-        const buildSingleFamilyFallback = () => {
-            if (preferredFamily === 'ipv6' && announcedIpV6) {
-                return [
-                    { protocol: 'udp', ip: '::', port, announcedIp: announcedIpV6 },
-                    { protocol: 'tcp', ip: '::', port, announcedIp: announcedIpV6 }
+        // Create IPv6-only WebRTC server  
+        if (announcedIpV6) {
+            try {
+                const ipv6ListenInfos = [
+                    { 
+                        protocol: 'udp', 
+                        ip: '::',
+                        port: port ? port + 1 : undefined, // Use different port for IPv6 to avoid conflicts
+                        announcedAddress: announcedIpV6,
+                        flags: { ipv6Only: true }
+                    },
+                    { 
+                        protocol: 'tcp', 
+                        ip: '::',
+                        port: port ? port + 1 : undefined,
+                        announcedAddress: announcedIpV6,
+                        flags: { ipv6Only: true }
+                    }
                 ];
+                webRtcServerIpv6 = await worker.createWebRtcServer({ listenInfos: ipv6ListenInfos });
+                console.log('[mediasoup] IPv6 WebRtcServer initialized:', ipv6ListenInfos);
+            } catch (err) {
+                console.error('[mediasoup] IPv6 WebRtcServer setup failed:', err?.message || err);
             }
-            if (announcedIpV4) {
-                return [
-                    { protocol: 'udp', ip: '0.0.0.0', port, announcedIp: announcedIpV4 },
-                    { protocol: 'tcp', ip: '0.0.0.0', port, announcedIp: announcedIpV4 }
-                ];
-            }
-            return [
+        }
+
+        // Fallback to legacy dual-stack if both servers failed to initialize
+        if (!webRtcServerIpv4 && !webRtcServerIpv6) {
+            console.warn('[mediasoup] Both IPv4 and IPv6 servers failed, falling back to dual-stack...');
+            const fallbackListenInfos = [
                 { protocol: 'udp', ip: '0.0.0.0', port },
                 { protocol: 'tcp', ip: '0.0.0.0', port }
             ];
-        };
-
-        let listenInfos = buildDualStackListenInfos();
-        try {
-            webRtcServer = await worker.createWebRtcServer({ listenInfos });
-            console.log('[mediasoup] Router and WebRtcServer initialized with (dual-stack):', listenInfos);
-        } catch (bindErr) {
-            console.error('[mediasoup] Dual-stack bind failed, retrying with single family:', bindErr && bindErr.message ? bindErr.message : bindErr);
-            listenInfos = buildSingleFamilyFallback();
-            webRtcServer = await worker.createWebRtcServer({ listenInfos });
-            console.log('[mediasoup] Router and WebRtcServer initialized with (fallback):', listenInfos);
+            webRtcServerIpv4 = await worker.createWebRtcServer({ listenInfos: fallbackListenInfos });
+            console.log('[mediasoup] Fallback WebRtcServer initialized:', fallbackListenInfos);
         }
+
+        console.log('[mediasoup] Router and WebRtcServers initialized successfully');
+        console.log(`[mediasoup] IPv4 server: ${webRtcServerIpv4 ? 'available' : 'unavailable'}`);
+        console.log(`[mediasoup] IPv6 server: ${webRtcServerIpv6 ? 'available' : 'unavailable'}`);
+        
     } catch (err) {
-        console.error('[mediasoup] Failed to initialize router/WebRtcServer:', err);
+        console.error('[mediasoup] Failed to initialize router/WebRtcServers:', err);
         router = null;
-        webRtcServer = null;
+        webRtcServerIpv4 = null;
+        webRtcServerIpv6 = null;
     }
 }
 
@@ -187,6 +221,13 @@ async function dspeakWebSocketHandler(ws, req) {
         ws.close();
         return;
     }
+
+    // Detect client IP family for appropriate transport selection
+    const clientIpFamily = getClientIpFamily(req);
+    console.log(`[ws] Client ${userId} connecting with IP family: ${clientIpFamily}`);
+    
+    // Attach IP family to ws for transport creation
+    ws.clientIpFamily = clientIpFamily;
 
     // Validate user/channel with main backend
     try {
@@ -299,13 +340,35 @@ async function dspeakWebSocketHandler(ws, req) {
                     ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
                     break;
                 case 'create-transport': {
-                    if (!router || !webRtcServer) {
-                        ws.send(JSON.stringify({ type: 'error', data: 'Router or WebRtcServer not ready' }));
+                    if (!router) {
+                        ws.send(JSON.stringify({ type: 'error', data: 'Router not ready' }));
                         break;
                     }
+                    
+                    // Select appropriate WebRTC server based on client IP family
+                    let selectedWebRtcServer;
+                    if (ws.clientIpFamily === 'ipv6' && webRtcServerIpv6) {
+                        selectedWebRtcServer = webRtcServerIpv6;
+                        console.log(`[ws] Using IPv6 WebRTC server for client ${ws.userId}`);
+                    } else if (ws.clientIpFamily === 'ipv4' && webRtcServerIpv4) {
+                        selectedWebRtcServer = webRtcServerIpv4;
+                        console.log(`[ws] Using IPv4 WebRTC server for client ${ws.userId}`);
+                    } else {
+                        // Fallback logic
+                        selectedWebRtcServer = webRtcServerIpv4 || webRtcServerIpv6;
+                        if (selectedWebRtcServer) {
+                            console.log(`[ws] Using fallback WebRTC server for client ${ws.userId} (${ws.clientIpFamily})`);
+                        }
+                    }
+                    
+                    if (!selectedWebRtcServer) {
+                        ws.send(JSON.stringify({ type: 'error', data: 'No WebRTC server available for your connection type' }));
+                        break;
+                    }
+                    
                     try {
                         const transport = await router.createWebRtcTransport({
-                            webRtcServer,
+                            webRtcServer: selectedWebRtcServer,
                             enableUdp: true,
                             enableTcp: true,
                             preferUdp: true,
@@ -316,17 +379,52 @@ async function dspeakWebSocketHandler(ws, req) {
                             channelTransports.get(ws.channelId).set(ws, new Map());
                         }
                         channelTransports.get(ws.channelId).get(ws).set(transport.id, transport);
+                        
+                        console.log(`[ws] Created transport ${transport.id} for ${ws.clientIpFamily} client ${ws.userId}`);
+                        console.log(`[ws] Original ICE candidates: ${transport.iceCandidates.length} candidates`);
+                        transport.iceCandidates.forEach((candidate, index) => {
+                            console.log(`[ws] Original candidate ${index}: ${candidate.address}:${candidate.port} (${candidate.protocol})`);
+                        });
+                        
+                        // Process ICE candidates to ensure correct announced ports for playit.gg tunnel
+                        let processedIceCandidates = transport.iceCandidates;
+                        if (ws.clientIpFamily === 'ipv4') {
+                            const ipv4SourcePort = parseInt(process.env.SFU_IPV4_PORT, 10);
+                            const announcedIpV4 = process.env.SFU_IPV4;
+                            const localPort = parseInt(process.env.SFU_PORT, 10) || 12825;
+                            
+                            if (ipv4SourcePort && announcedIpV4) {
+                                processedIceCandidates = transport.iceCandidates.map(candidate => {
+                                    // Fix IPv4 candidates: replace local port with external playit.gg port
+                                    if (candidate.address === announcedIpV4 && candidate.port === localPort) {
+                                        console.log(`[ws] Correcting IPv4 candidate port: ${candidate.address}:${candidate.port} -> ${candidate.address}:${ipv4SourcePort}`);
+                                        return {
+                                            ...candidate,
+                                            port: ipv4SourcePort
+                                        };
+                                    }
+                                    return candidate;
+                                });
+                            }
+                        }
+                        
+                        console.log(`[ws] Final ICE candidates: ${processedIceCandidates.length} candidates`);
+                        processedIceCandidates.forEach((candidate, index) => {
+                            console.log(`[ws] Final candidate ${index}: ${candidate.address}:${candidate.port} (${candidate.protocol})`);
+                        });
+                        
                         ws.send(JSON.stringify({
                             type: 'transport-params',
                             data: {
                                 id: transport.id,
                                 iceParameters: transport.iceParameters,
-                                iceCandidates: transport.iceCandidates,
+                                iceCandidates: processedIceCandidates,
                                 dtlsParameters: transport.dtlsParameters,
                                 sctpParameters: transport.sctpParameters || undefined
                             }
                         }));
                     } catch (err) {
+                        console.error(`[ws] Failed to create transport for ${ws.clientIpFamily} client:`, err?.message || err);
                         ws.send(JSON.stringify({ type: 'error', data: 'Failed to create transport' }));
                     }
                     break;
