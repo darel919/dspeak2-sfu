@@ -2,6 +2,24 @@ import '../../env.js';
 import mediasoup from 'mediasoup'
 import WebSocket from 'ws';
 
+// --- ICE Server Config Loader ---
+let iceServers = [];
+async function loadIceServers() {
+    try {
+        const apiBase = process.env.INTEROP_API_BASE_URL;
+        if (!apiBase) return;
+        const res = await fetch(`${apiBase}/dspeak/config`);
+        if (res.ok) {
+            iceServers = await res.json();
+            console.info('[mediasoup] Loaded ICE server config:', iceServers);
+        } else {
+            console.warn('[mediasoup] Failed to fetch ICE server config:', res.status);
+        }
+    } catch (err) {
+        console.warn('[mediasoup] Error loading ICE server config:', err && err.message ? err.message : err);
+    }
+}
+
 // --- Interop WebSocket Client ---
 let interopWs;
 function resolveInteropWsUrl() {
@@ -76,6 +94,7 @@ const mediaCodecs = [
 
 async function initMediasoup() {
     try {
+        await loadIceServers();
         worker = await mediasoup.createWorker();
         router = await worker.createRouter({ mediaCodecs });
         // --- WebRtcServer setup ---
@@ -84,7 +103,9 @@ async function initMediasoup() {
         const port = parseInt(process.env.SFU_PORT, 10) || undefined;
         const announcedIpV4 = (process.env.SFU_IPV4 || '').trim();
         const announcedIpV6 = (process.env.SFU_IPV6 || '').trim();
-        const preferredFamily = (process.env.SFU_PREFERRED_FAMILY).toLowerCase() || undefined;
+        const preferredFamily = typeof process.env.SFU_PREFERRED_FAMILY === 'string' && process.env.SFU_PREFERRED_FAMILY
+            ? process.env.SFU_PREFERRED_FAMILY.toLowerCase()
+            : undefined;
 
         const buildDualStackListenInfos = () => {
             const infos = [];
@@ -287,7 +308,8 @@ async function dspeakWebSocketHandler(ws, req) {
                             webRtcServer,
                             enableUdp: true,
                             enableTcp: true,
-                            preferUdp: true
+                            preferUdp: true,
+                            iceServers: Array.isArray(iceServers) && iceServers.length > 0 ? iceServers : undefined
                         });
                         // Ensure inner maps exist
                         if (!channelTransports.get(ws.channelId).has(ws)) {

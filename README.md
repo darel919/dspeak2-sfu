@@ -57,11 +57,12 @@ The handler enables real-time audio communication using MediaSoup. It manages We
 
 ### 3. Message Handling
 - `ping`: Replies with a `pong` and timestamp.
-- `create-transport`: Creates a MediaSoup WebRTC transport for the client.
-  - Uses `listenIps` with dynamic `announcedIp`:
-    - Production: `api.darelisme.my.id`
-    - Development: `localhost`
-  - Sends transport parameters (`id`, `iceParameters`, `iceCandidates`, `dtlsParameters`) to the client.
+- `create-transport`: Creates a MediaSoup WebRTC transport for the client using a shared WebRtcServer bound to fixed ports.
+  - The server advertises public IP/port via WebRtcServer `listenInfos` using environment variables:
+    - IPv4: `SFU_IPV4` and `SFU_IPV4_PORT` (or `PLAYIT_PUBLIC_PORT`)
+    - IPv6: `SFU_IPV6` and optional `SFU_IPV6_PORT`
+    - Optional preference: `SFU_PREFERRED_FAMILY=ipv4|ipv6`
+  - Sends transport parameters (`id`, `iceParameters`, `iceCandidates`, `dtlsParameters`, optional `sctpParameters`) to the client.
 - `connect-transport`: Client sends DTLS parameters to connect the transport.
 - `produce`: Client sends media parameters to create a producer (audio stream).
 - `consume`: Client requests to consume another client's producer stream. Server responds with consumer parameters (`id`, `producerId`, `kind`, `rtpParameters`).
@@ -69,8 +70,17 @@ The handler enables real-time audio communication using MediaSoup. It manages We
 ### 4. Resource Cleanup
 - On client disconnect, associated transport, producer, and consumer are closed and removed.
 
-### 4. Environment Awareness
-- The code checks `process.env.NODE_ENV` to determine the environment and set the correct public IP/domain for WebRTC signaling.
+### 4. Environment & SFU networking
+- The server uses mediasoup WebRtcServer with explicit `listenInfos` so ICE candidates contain the exact public IP and port you configure.
+- Key variables (see `.env.example`):
+  - `SFU_PORT`: internal bind port for UDP/TCP (may be auto if omitted)
+  - `SFU_IPV4`: public IPv4 to announce (e.g., from playit.gg)
+  - `SFU_IPV4_PORT`: public port to announce for IPv4 (fallback to `PLAYIT_PUBLIC_PORT`)
+  - `SFU_IPV6`: public IPv6 to announce (your host’s global IPv6)
+  - `SFU_IPV6_PORT`: public port to announce for IPv6 (defaults to `SFU_PORT` when set)
+  - `SFU_PREFERRED_FAMILY`: set to `ipv4` to force IPv4-only candidates, or `ipv6` to force IPv6-only
+  - `PLAYIT_PUBLIC_PORT`: convenient fallback for IPv4 port when using playit.gg
+- HTTP and signaling remain on the Express port (`PORT`, default 8425). The mediasoup RTP/ICE ports are controlled via the variables above.
 
 ## Example Usage
 - Connect to the WebSocket endpoint.
