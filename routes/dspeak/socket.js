@@ -77,6 +77,7 @@ const channelPresence = new Map(); // channelId -> Set of userIds
 const channelTransports = new Map(); // channelId -> Map<ws, Map<transportId, transport>>
 const channelProducers = new Map(); // channelId -> Map<ws, producer>
 const channelConsumers = new Map(); // channelId -> Map<ws, consumer>
+const channelProducerUserMap = new Map(); // channelId -> Map<producerId, userId>
 
 const isProd = process.env.NODE_ENV === 'production';
 let worker;
@@ -287,12 +288,16 @@ async function dspeakWebSocketHandler(ws, req) {
     const producers = channelProducers.has(channelId)
         ? Array.from(channelProducers.get(channelId).values()).map(p => p.id)
         : [];
+    const producerUserMap = channelProducerUserMap.has(channelId)
+        ? Object.fromEntries(channelProducerUserMap.get(channelId).entries())
+        : {};
     for (const client of clients) {
         if (client.channelId === channelId) {
             client.send(JSON.stringify({
                 type: 'currentlyInChannel',
                 inRoom,
-                producers
+                producers,
+                producerUserMap
             }));
         }
     }
@@ -305,6 +310,45 @@ async function dspeakWebSocketHandler(ws, req) {
             message: 'dspeak socket connection successful'
         }
     }));
+
+    // On join: automatically create consumers for all existing producers
+    setImmediate(async () => {
+        const wsTransports = channelTransports.get(ws.channelId).get(ws);
+        if (!wsTransports || wsTransports.size === 0) return;
+        // Wait for client to send rtpCapabilities before consuming
+        // Optionally, cache rtpCapabilities per ws if you want to automate
+        // For now, only create consumer if client has sent rtpCapabilities
+        if (ws._lastRtpCapabilities) {
+            for (const [client, producer] of channelProducers.get(ws.channelId).entries()) {
+                if (client === ws) continue;
+                let transport = Array.from(wsTransports.values())[wsTransports.size - 1];
+                if (!transport) continue;
+                if (!router.canConsume({ producerId: producer.id, rtpCapabilities: ws._lastRtpCapabilities })) continue;
+                try {
+                    const consumer = await transport.consume({
+                        producerId: producer.id,
+                        rtpCapabilities: ws._lastRtpCapabilities,
+                        paused: false,
+                    });
+                    if (!channelConsumers.get(ws.channelId).has(ws)) {
+                        channelConsumers.get(ws.channelId).set(ws, new Map());
+                    }
+                    channelConsumers.get(ws.channelId).get(ws).set(producer.id, consumer);
+                    ws.send(JSON.stringify({
+                        type: 'consumer-params',
+                        data: {
+                            id: consumer.id,
+                            producerId: producer.id,
+                            kind: consumer.kind,
+                            rtpParameters: consumer.rtpParameters,
+                        }
+                    }));
+                } catch (err) {
+                    ws.send(JSON.stringify({ type: 'error', data: `Failed to create consumer for producer ${producer.id}` }));
+                }
+            }
+        }
+    });
 
     ws.on('message', async (message) => {
         let data;
@@ -339,6 +383,32 @@ async function dspeakWebSocketHandler(ws, req) {
                 case 'ping':
                     ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
                     break;
+                    case 'client-rtp-capabilities': {
+                        // Client sends its RTP capabilities after receiving router's
+                        if (!data.data || typeof data.data !== 'object') {
+                            ws.send(JSON.stringify({ type: 'error', data: 'Missing RTP capabilities in message' }));
+                            break;
+                        }
+
+                        // Normalization: some clients wrap the capabilities under { rtpCapabilities: {...} }
+                        // while others send the raw capabilities object. Accept both shapes and store the
+                        // actual rtpCapabilities object at ws._lastRtpCapabilities for later canConsume checks.
+                        const incoming = data.data;
+                        if (incoming.rtpCapabilities && typeof incoming.rtpCapabilities === 'object') {
+                            ws._lastRtpCapabilities = incoming.rtpCapabilities;
+                        } else {
+                            ws._lastRtpCapabilities = incoming;
+                        }
+
+                        // Defensive: ensure it's an object with codecs array
+                        if (!ws._lastRtpCapabilities || !Array.isArray(ws._lastRtpCapabilities.codecs)) {
+                            ws.send(JSON.stringify({ type: 'error', data: 'Invalid RTP capabilities format' }));
+                            break;
+                        }
+
+                        ws.send(JSON.stringify({ type: 'rtp-capabilities-ack' }));
+                        break;
+                    }
                 case 'create-transport': {
                     if (!router) {
                         ws.send(JSON.stringify({ type: 'error', data: 'Router not ready' }));
@@ -499,20 +569,107 @@ async function dspeakWebSocketHandler(ws, req) {
                             ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
                             break;
                         }
-                        const producer = await transport.produce({ kind, rtpParameters });
-                        channelProducers.get(ws.channelId).set(ws, producer);
-                        ws.send(JSON.stringify({ type: 'producer-id', data: { id: producer.id } }));
-                        // Notify all other clients in channel of new producer (exclude producer's own client)
-                        for (const client of clients) {
-                            if (client !== ws && client.channelId === ws.channelId) {
-                                client.send(JSON.stringify({
-                                    type: 'new-producer',
-                                    data: { producerId: producer.id }
-                                }));
+                        
+                        // Enforce one audio producer per user
+                        const userProducerMap = channelProducers.get(ws.channelId);
+                        for (const [client, existingProducer] of userProducerMap.entries()) {
+                            if (client.userId === ws.userId && client !== ws && existingProducer) {
+                                existingProducer.close();
+                                userProducerMap.delete(client);
+                                if (channelProducerUserMap.has(ws.channelId)) {
+                                    channelProducerUserMap.get(ws.channelId).delete(existingProducer.id);
+                                }
                             }
                         }
+                        
+                        const producer = await transport.produce({ kind, rtpParameters });
+                        channelProducers.get(ws.channelId).set(ws, producer);
+                        if (!channelProducerUserMap.has(ws.channelId)) channelProducerUserMap.set(ws.channelId, new Map());
+                        channelProducerUserMap.get(ws.channelId).set(producer.id, ws.userId);
+                        ws.send(JSON.stringify({ type: 'producer-id', data: { id: producer.id, userId: ws.userId, channelId: ws.channelId } }));
+                        
+                        // Notify interop server of new producer
+                        sendInteropEvent({
+                            type: 'media_producer',
+                            event: 'add',
+                            userId,
+                            channelId,
+                            producerId: producer.id,
+                            timestamp: new Date().toISOString()
+                        });
+                        
+                        // Broadcast updated producers to all in channel
+                        const inRoom = Array.from(channelPresence.get(channelId));
+                        const producers = channelProducers.has(channelId)
+                            ? Array.from(channelProducers.get(channelId).values()).map(p => p.id)
+                            : [];
+                        const producerUserMap = channelProducerUserMap.has(channelId)
+                            ? Object.fromEntries(channelProducerUserMap.get(channelId).entries())
+                            : {};
+                        for (const client of clients) {
+                            if (client.channelId === channelId) {
+                                client.send(JSON.stringify({
+                                    type: 'currentlyInChannel',
+                                    inRoom,
+                                    producers,
+                                    producerUserMap
+                                }));
+                                    // Always send available producerIds after produce
+                                    client.send(JSON.stringify({
+                                        type: 'available-producers',
+                                        data: { producers, producerUserMap }
+                                    }));
+                            }
+                        }
+                        
+                        // Auto-consume logic: immediately create consumer for this producer on other clients
+                        setImmediate(async () => {
+                            for (const client of clients) {
+                                if (client.channelId !== ws.channelId || client === ws) continue;
+                                const clientTransports = channelTransports.get(client.channelId).get(client);
+                                if (!clientTransports || clientTransports.size === 0) continue;
+                                let transport = Array.from(clientTransports.values())[clientTransports.size - 1];
+                                if (!transport) continue;
+                                if (!router.canConsume({ producerId: producer.id, rtpCapabilities: client._lastRtpCapabilities })) continue;
+                                try {
+                                    const consumer = await transport.consume({
+                                        producerId: producer.id,
+                                        rtpCapabilities: client._lastRtpCapabilities,
+                                        paused: false,
+                                    });
+                                    if (!channelConsumers.get(client.channelId).has(client)) {
+                                        channelConsumers.get(client.channelId).set(client, new Map());
+                                    }
+                                    channelConsumers.get(client.channelId).get(client).set(producer.id, consumer);
+                                    client.send(JSON.stringify({
+                                        type: 'consumer-params',
+                                        data: {
+                                            id: consumer.id,
+                                            producerId: producer.id,
+                                            kind: consumer.kind,
+                                            rtpParameters: consumer.rtpParameters,
+                                            userId: channelProducerUserMap.get(ws.channelId)?.get(producer.id) || null
+                                        }
+                                    }));
+                                } catch (err) {
+                                    client.send(JSON.stringify({ type: 'error', data: `Failed to create consumer for new producer ${producer.id}` }));
+                                }
+                            }
+                        });
+                        
+                        ws.send(JSON.stringify({
+                            type: 'produced',
+                            data: {
+                                id: producer.id,
+                                userId,
+                                channelId,
+                                kind: producer.kind,
+                                rtpParameters: producer.rtpParameters,
+                            }
+                        }));
                     } catch (err) {
-                        ws.send(JSON.stringify({ type: 'error', data: 'Failed to create producer' }));
+                        console.error(`[ws] Failed to handle produce request:`, err?.message || err);
+                        ws.send(JSON.stringify({ type: 'error', data: 'Failed to produce media' }));
                     }
                     break;
                 }
@@ -523,128 +680,197 @@ async function dspeakWebSocketHandler(ws, req) {
                         ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
                         break;
                     }
-                    const { rtpCapabilities, transportId } = data.data;
-                    let transport = transportId ? wsTransports.get(transportId) : null;
-                    if (!transport) {
-                        // Fallback to last (most recently created) transport for consuming
-                        const vals = Array.from(wsTransports.values());
-                        transport = vals[vals.length - 1];
+                    try {
+                        const { producerId, transportId } = data.data;
+                            // Validate producerId
+                            if (!producerId || typeof producerId !== 'string') {
+                                ws.send(JSON.stringify({ type: 'error', data: 'Missing or invalid producerId in consume request' }));
+                                break;
+                            }
+                        let transport = wsTransports.get(transportId);
+                        if (!transport) {
+                            ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
+                            break;
+                        }
+                        // Check if we can consume this producer
+                        const producerExists = channelProducers.get(ws.channelId) && Array.from(channelProducers.get(ws.channelId).values()).find(p => p.id === producerId);
+                        if (!producerExists) {
+                            console.warn(`[ws] Cannot consume: producerId ${producerId} not found for user ${ws.userId} in channel ${ws.channelId}`);
+                            ws.send(JSON.stringify({ type: 'error', data: 'Cannot consume this producer: producer not found' }));
+                            break;
+                        }
+                        // Check for missing RTP capabilities
+                            if (!ws._lastRtpCapabilities) {
+                                ws.send(JSON.stringify({ type: 'error', data: 'Cannot consume: missing RTP capabilities. Please send your RTP capabilities first.' }));
+                                break;
+                            }
+                        if (!router.canConsume({ producerId, rtpCapabilities: ws._lastRtpCapabilities })) {
+                            // Find the producer object for detailed logging
+                            const producerObj = Array.from(channelProducers.get(ws.channelId).values()).find(p => p.id === producerId);
+
+                            // Stringify deep objects for clearer logs (avoid truncation of nested objects)
+                            const producerRtp = producerObj && producerObj.rtpParameters ? producerObj.rtpParameters : null;
+                            try {
+                                console.warn(`[ws] Cannot consume: router cannot consume producerId ${producerId} for user ${ws.userId} in channel ${ws.channelId}.`);
+                                console.warn('[ws] Producer RTP parameters (full):', JSON.stringify(producerRtp, null, 2));
+                            } catch (e) {
+                                console.warn('[ws] Producer RTP parameters (raw):', producerRtp);
+                            }
+                            try {
+                                console.warn('[ws] Client RTP capabilities (full):', JSON.stringify(ws._lastRtpCapabilities, null, 2));
+                            } catch (e) {
+                                console.warn('[ws] Client RTP capabilities (raw):', ws._lastRtpCapabilities);
+                            }
+
+                            ws.send(JSON.stringify({ type: 'error', data: 'Cannot consume this producer: codec/parameter mismatch' }));
+                            break;
+                        }
+                        const consumer = await transport.consume({
+                            producerId,
+                            rtpCapabilities: ws._lastRtpCapabilities,
+                            paused: false,
+                        });
+                        if (!channelConsumers.get(ws.channelId).has(ws)) {
+                            channelConsumers.get(ws.channelId).set(ws, new Map());
+                        }
+                        channelConsumers.get(ws.channelId).get(ws).set(producerId, consumer);
+                        ws.send(JSON.stringify({
+                            type: 'consumer-params',
+                            data: {
+                                id: consumer.id,
+                                producerId,
+                                kind: consumer.kind,
+                                rtpParameters: consumer.rtpParameters,
+                            }
+                        }));
+                    } catch (err) {
+                        console.error(`[ws] Failed to handle consume request:`, err?.message || err);
+                        ws.send(JSON.stringify({ type: 'error', data: 'Failed to consume media' }));
                     }
-                    if (!transport) {
+                    break;
+                }
+                case 'resume': {
+                    console.log(`[ws] Received 'resume' from user ${ws.userId} in channel ${ws.channelId}`);
+                    const wsTransports = channelTransports.get(ws.channelId).get(ws);
+                    if (!wsTransports || wsTransports.size === 0) {
                         ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
                         break;
                     }
-                    // Loop through all remote producers in the channel (not self)
-                    let foundProducer = false;
-                    for (const [client, producer] of channelProducers.get(ws.channelId).entries()) {
-                        if (client === ws) continue;
-                        if (!router.canConsume({ producerId: producer.id, rtpCapabilities })) {
-                            ws.send(JSON.stringify({ type: 'error', data: `Cannot consume producer ${producer.id}` }));
-                            continue;
+                    try {
+                        const { transportId } = data.data;
+                        let transport = wsTransports.get(transportId);
+                        if (!transport) {
+                            ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
+                            break;
                         }
-                        try {
-                            const consumer = await transport.consume({
-                                producerId: producer.id,
-                                rtpCapabilities,
-                                paused: false,
-                            });
-                            // Store consumer per producer for this ws
-                            if (!channelConsumers.get(ws.channelId).has(ws)) {
-                                channelConsumers.get(ws.channelId).set(ws, new Map());
-                            }
-                            channelConsumers.get(ws.channelId).get(ws).set(producer.id, consumer);
-                            ws.send(JSON.stringify({
-                                type: 'consumer-params',
-                                data: {
-                                    id: consumer.id,
-                                    producerId: producer.id,
-                                    kind: consumer.kind,
-                                    rtpParameters: consumer.rtpParameters,
-                                }
-                            }));
-                            foundProducer = true;
-                        } catch (err) {
-                            ws.send(JSON.stringify({ type: 'error', data: `Failed to create consumer for producer ${producer.id}` }));
-                        }
+                        await transport.resume();
+                        ws.send(JSON.stringify({ type: 'resumed' }));
+                    } catch (err) {
+                        console.error(`[ws] Failed to resume transport:`, err?.message || err);
+                        ws.send(JSON.stringify({ type: 'error', data: 'Failed to resume transport' }));
                     }
-                    if (!foundProducer) {
-                        ws.send(JSON.stringify({ type: 'error', data: 'No remote producers available' }));
+                    break;
+                }
+                case 'pause': {
+                    console.log(`[ws] Received 'pause' from user ${ws.userId} in channel ${ws.channelId}`);
+                    const wsTransports = channelTransports.get(ws.channelId).get(ws);
+                    if (!wsTransports || wsTransports.size === 0) {
+                        ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
+                        break;
+                    }
+                    try {
+                        const { transportId } = data.data;
+                        let transport = wsTransports.get(transportId);
+                        if (!transport) {
+                            ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
+                            break;
+                        }
+                        await transport.pause();
+                        ws.send(JSON.stringify({ type: 'paused' }));
+                    } catch (err) {
+                        console.error(`[ws] Failed to pause transport:`, err?.message || err);
+                        ws.send(JSON.stringify({ type: 'error', data: 'Failed to pause transport' }));
+                    }
+                    break;
+                }
+                case 'close-transport': {
+                    console.log(`[ws] Received 'close-transport' from user ${ws.userId} in channel ${ws.channelId}`);
+                    const wsTransports = channelTransports.get(ws.channelId).get(ws);
+                    if (!wsTransports || wsTransports.size === 0) {
+                        ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
+                        break;
+                    }
+                    try {
+                        const { transportId } = data.data;
+                        let transport = wsTransports.get(transportId);
+                        if (!transport) {
+                            ws.send(JSON.stringify({ type: 'error', data: 'Transport not found' }));
+                            break;
+                        }
+                        await transport.close();
+                        ws.send(JSON.stringify({ type: 'transport-closed' }));
+                    } catch (err) {
+                        console.error(`[ws] Failed to close transport:`, err?.message || err);
+                        ws.send(JSON.stringify({ type: 'error', data: 'Failed to close transport' }));
                     }
                     break;
                 }
                 default:
                     ws.send(JSON.stringify({ type: 'error', data: `Unknown message type: ${data.type}` }));
             }
-        } catch (error) {
-            ws.send(JSON.stringify({ type: 'error', data: 'Error parsing or handling message' }));
+        } catch (err) {
+            console.error('[ws] Error handling message:', err);
+            ws.send(JSON.stringify({ type: 'error', data: 'Internal server error' }));
         }
     });
 
     ws.on('close', () => {
+        console.log(`[ws] Client ${userId} disconnected from channel ${channelId}`);
         clients.delete(ws);
         // Remove from channel presence
-        if (channelPresence.has(ws.channelId)) {
-            channelPresence.get(ws.channelId).delete(ws.userId);
-            // Notify main server of leave event
-            sendInteropEvent({
-                type: 'media_presence',
-                event: 'leave',
-                userId: ws.userId,
-                channelId: ws.channelId,
-                timestamp: new Date().toISOString()
-            });
-            // Sync full presence
-            sendInteropEvent({
-                type: 'channel_presence_sync',
-                channelId: ws.channelId,
-                userIds: Array.from(channelPresence.get(ws.channelId))
-            });
-            // Broadcast updated presence and producers
-            const inRoom = Array.from(channelPresence.get(ws.channelId));
-            const producers = channelProducers.has(ws.channelId)
-                ? Array.from(channelProducers.get(ws.channelId).values()).map(p => p.id)
-                : [];
-            for (const client of clients) {
-                if (client.channelId === ws.channelId) {
-                    client.send(JSON.stringify({
-                        type: 'currentlyInChannel',
-                        inRoom,
-                        producers
-                    }));
-                }
+        if (channelPresence.has(channelId)) {
+            channelPresence.get(channelId).delete(userId);
+            if (channelPresence.get(channelId).size === 0) {
+                channelPresence.delete(channelId);
             }
         }
-        // Clean up per-channel media
-        if (channelTransports.has(ws.channelId)) {
-            const tmap = channelTransports.get(ws.channelId);
-            const wsTransports = tmap.get(ws);
+        // Notify main server of leave event
+        sendInteropEvent({
+            type: 'media_presence',
+            event: 'leave',
+            userId,
+            channelId,
+            timestamp: new Date().toISOString()
+        });
+        // Cleanup transports, producers, consumers
+        if (channelTransports.has(channelId)) {
+            const wsTransports = channelTransports.get(channelId).get(ws);
             if (wsTransports) {
-                for (const t of wsTransports.values()) {
-                    try { t.close(); } catch {}
+                for (const transport of wsTransports.values()) {
+                    if (typeof transport?.close === 'function') {
+                        try {
+                            transport.close();
+                        } catch (err) {
+                            console.warn('[mediasoup] Error closing transport:', err);
+                        }
+                    }
                 }
+                channelTransports.get(channelId).delete(ws);
             }
-            tmap.delete(ws);
         }
-        if (channelProducers.has(ws.channelId)) {
-            const pmap = channelProducers.get(ws.channelId);
+        if (channelProducers.has(channelId)) {
+            const pmap = channelProducers.get(channelId);
             const producer = pmap.get(ws);
-            if (producer) producer.close();
-            pmap.delete(ws);
-        }
-        if (channelConsumers.has(ws.channelId)) {
-            const cmap = channelConsumers.get(ws.channelId);
-            const wsConsumers = cmap.get(ws);
-            if (wsConsumers && wsConsumers instanceof Map) {
-                for (const consumer of wsConsumers.values()) {
-                    try { consumer.close(); } catch {}
+            if (producer) {
+                producer.close();
+                // Remove mapping and notify clients
+                if (channelProducerUserMap.has(ws.channelId)) {
+                    channelProducerUserMap.get(ws.channelId).delete(producer.id);
                 }
-            } else if (wsConsumers) {
-                // Legacy: single consumer
-                try { wsConsumers.close(); } catch {}
+                pmap.delete(ws);
             }
-            cmap.delete(ws);
         }
     });
 }
 
-export { dspeakWebSocketHandler, clients };
+export {dspeakWebSocketHandler}
