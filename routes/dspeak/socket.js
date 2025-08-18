@@ -1,6 +1,7 @@
 import '../../env.js';
 import mediasoup from 'mediasoup'
 import WebSocket from 'ws';
+import { incCounter, setGauge } from '../../lib/metrics.js';
 
 // --- ICE Server Config Loader ---
 let iceServers = [];
@@ -92,6 +93,46 @@ const mediaCodecs = [
         channels: 2
     }
 ];
+
+// Monitoring / heartbeat / staging state
+const stagedParticipants = new Map(); // key = `${channelId}:${userId}` -> { transports, producer, consumers, timer, ts }
+let globalRequestCounter = 0;
+const HEARTBEAT_INTERVAL_MS = parseInt(process.env.SFU_HEARTBEAT_INTERVAL_MS, 10) || 15000; // send ping every 15s
+const HEARTBEAT_MISS_THRESHOLD_MS = parseInt(process.env.SFU_HEARTBEAT_MISS_THRESHOLD_MS, 10) || 60000; // 60s timeout default
+const GRACE_MS = parseInt(process.env.SFU_GRACE_MS, 10) || 60000; // keep participant state for 60s by default
+
+function nextRequestId() {
+    return `${Date.now()}-${++globalRequestCounter}`;
+}
+
+function logLifecycle(event, details = {}) {
+    try {
+        const log = Object.assign({ timestamp: new Date().toISOString(), event, workerId: worker && worker.pid ? worker.pid : null }, details);
+        console.log('[SFU-Lifecycle]', JSON.stringify(log));
+    } catch (e) {
+        console.log('[SFU-Lifecycle] ', event, details);
+    }
+}
+
+// Heartbeat monitor: check last-seen timestamps from client-sent pings and stage stale connections
+setInterval(() => {
+    const now = Date.now();
+    for (const ws of clients) {
+        try {
+            if (ws.readyState !== WebSocket.OPEN) continue;
+            // If client never sent a ping, treat age from connection time
+            if (!ws.lastHeartbeat) ws.lastHeartbeat = ws._connectedAt || now;
+            const age = now - (ws.lastHeartbeat || 0);
+            if (age > HEARTBEAT_MISS_THRESHOLD_MS) {
+                logLifecycle('heartbeat-timeout', { userId: ws.userId || null, channelId: ws.channelId || null, ageMs: age });
+                // Stage disconnect for grace window
+                stageDisconnect(ws, 'heartbeat-timeout');
+            }
+        } catch (e) {
+            console.warn('[SFU] Heartbeat monitor error for ws:', e && e.message ? e.message : e);
+        }
+    }
+}, HEARTBEAT_INTERVAL_MS);
 
 
 // Helper function to detect client IP family from WebSocket request
@@ -259,8 +300,44 @@ async function dspeakWebSocketHandler(ws, req) {
     // Attach context to ws
     ws.userId = userId;
     ws.channelId = channelId;
+    ws._connectedAt = Date.now();
 
-    clients.add(ws);
+    // Helper to send messages with correlation id
+    ws.sendWithId = function(obj) {
+        try {
+            if (!obj.requestId) obj.requestId = nextRequestId();
+            ws.send(JSON.stringify(obj));
+        } catch (e) {
+            console.warn('[SFU] sendWithId failed', e && e.message ? e.message : e);
+        }
+    };
+    // If this user/channel was recently staged, restore resources
+    if (restoreIfStaged(ws)) {
+        clients.add(ws);
+        ws.send(JSON.stringify({
+            type: 'connected',
+            data: {
+                channelId,
+                userId,
+                message: 'dspeak socket restored from staged state'
+            }
+        }));
+        // Broadcast presence and available producers to channel
+        const inRoom = channelPresence.has(channelId) ? Array.from(channelPresence.get(channelId)) : [];
+        const producers = channelProducers.has(channelId)
+            ? Array.from(channelProducers.get(channelId).values()).map(p => p.id)
+            : [];
+        const producerUserMap = channelProducerUserMap.has(channelId)
+            ? Object.fromEntries(channelProducerUserMap.get(channelId).entries())
+            : {};
+        for (const client of clients) {
+            if (client.channelId === channelId) {
+                client.send(JSON.stringify({ type: 'currentlyInChannel', inRoom, producers, producerUserMap }));
+            }
+        }
+    } else {
+        clients.add(ws);
+    }
     // Add user to channel presence
     if (!channelPresence.has(channelId)) channelPresence.set(channelId, new Set());
     channelPresence.get(channelId).add(userId);
@@ -381,7 +458,16 @@ async function dspeakWebSocketHandler(ws, req) {
             }
             switch (data.type) {
                 case 'ping':
-                    ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+                    // Reply quickly with pong and mirror requestId if present
+                    ws.lastHeartbeat = Date.now();
+                    ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now(), requestId: data.requestId || null }));
+                    break;
+                case 'pong':
+                    // Client replied to our ping
+                    ws.lastHeartbeat = Date.now();
+                    if (data.requestId) {
+                        logLifecycle('pong-received', { userId: ws.userId, channelId: ws.channelId, requestId: data.requestId });
+                    }
                     break;
                     case 'client-rtp-capabilities': {
                         // Client sends its RTP capabilities after receiving router's
@@ -406,7 +492,7 @@ async function dspeakWebSocketHandler(ws, req) {
                             break;
                         }
 
-                        ws.send(JSON.stringify({ type: 'rtp-capabilities-ack' }));
+                        ws.sendWithId({ type: 'rtp-capabilities-ack' });
                         break;
                     }
                 case 'create-transport': {
@@ -450,10 +536,30 @@ async function dspeakWebSocketHandler(ws, req) {
                         }
                         channelTransports.get(ws.channelId).get(ws).set(transport.id, transport);
                         
+                        logLifecycle('transport-created', { transportId: transport.id, userId: ws.userId, channelId: ws.channelId, clientIpFamily: ws.clientIpFamily });
                         console.log(`[ws] Created transport ${transport.id} for ${ws.clientIpFamily} client ${ws.userId}`);
                         console.log(`[ws] Original ICE candidates: ${transport.iceCandidates.length} candidates`);
                         transport.iceCandidates.forEach((candidate, index) => {
                             console.log(`[ws] Original candidate ${index}: ${candidate.address}:${candidate.port} (${candidate.protocol})`);
+                        });
+
+                        // Attach ICE/DTLS state listeners
+                        transport.on?.('icestatechange', (iceState) => {
+                            logLifecycle('transport-ice-state', { transportId: transport.id, userId: ws.userId, channelId: ws.channelId, iceState });
+                        });
+                        transport.on?.('iceselectedtuplechange', (info) => {
+                            logLifecycle('transport-ice-selected-pair', { transportId: transport.id, userId: ws.userId, channelId: ws.channelId, selectedPair: info });
+                        });
+                        transport.on?.('dtlsstatechange', (dtlsState) => {
+                            logLifecycle('transport-dtls-state', { transportId: transport.id, userId: ws.userId, channelId: ws.channelId, dtlsState });
+                            if (dtlsState === 'failed') {
+                                // send advisory before closing
+                                try {
+                                    ws.send(JSON.stringify({ type: 'transport-closed', transportId: transport.id, reason: 'dtls-failed' }));
+                                } catch (e) {}
+                                incCounter('sfu_transport_dtls_failed_total');
+                                stageDisconnect(ws, 'dtls-failed');
+                            }
                         });
                         
                         // Process ICE candidates to ensure correct announced ports for playit.gg tunnel
@@ -506,8 +612,9 @@ async function dspeakWebSocketHandler(ws, req) {
                         break;
                     }
                     try {
+                        logLifecycle('get-rtp-capabilities', { userId: ws.userId, channelId: ws.channelId });
                         const rtpCaps = JSON.parse(JSON.stringify(router.rtpCapabilities));
-                        ws.send(JSON.stringify({ type: 'rtp-capabilities', data: rtpCaps }));
+                        ws.sendWithId({ type: 'rtp-capabilities', data: rtpCaps });
                     } catch (err) {
                         console.error('[ws] get-rtp-capabilities: Failed to get RTP capabilities', err);
                         ws.send(JSON.stringify({ type: 'error', data: 'Failed to get RTP capabilities', details: err && err.message }));
@@ -521,6 +628,7 @@ async function dspeakWebSocketHandler(ws, req) {
                         break;
                     }
                     try {
+                        logLifecycle('connect-transport-request', { userId: ws.userId, channelId: ws.channelId });
                         const { dtlsParameters, transportId } = data.data || {};
                         if (transportId) {
                             const transport = wsTransports.get(transportId);
@@ -584,6 +692,16 @@ async function dspeakWebSocketHandler(ws, req) {
                         
                         const producer = await transport.produce({ kind, rtpParameters });
                         channelProducers.get(ws.channelId).set(ws, producer);
+                        logLifecycle('producer-created', { producerId: producer.id, userId: ws.userId, channelId: ws.channelId });
+                        // Attach close listener
+                        producer.on?.('transportclose', () => {
+                            logLifecycle('producer-transport-closed', { producerId: producer.id, userId: ws.userId, channelId: ws.channelId });
+                            incCounter('sfu_producer_transport_closed_total');
+                        });
+                        producer.on?.('close', () => {
+                            logLifecycle('producer-closed', { producerId: producer.id, userId: ws.userId, channelId: ws.channelId });
+                            incCounter('sfu_producer_closed_total');
+                        });
                         if (!channelProducerUserMap.has(ws.channelId)) channelProducerUserMap.set(ws.channelId, new Map());
                         channelProducerUserMap.get(ws.channelId).set(producer.id, ws.userId);
                         ws.send(JSON.stringify({ type: 'producer-id', data: { id: producer.id, userId: ws.userId, channelId: ws.channelId } }));
@@ -730,6 +848,15 @@ async function dspeakWebSocketHandler(ws, req) {
                             rtpCapabilities: ws._lastRtpCapabilities,
                             paused: false,
                         });
+                        logLifecycle('consumer-created', { consumerId: consumer.id, producerId, userId: ws.userId, channelId: ws.channelId });
+                        consumer.on?.('close', () => {
+                            logLifecycle('consumer-closed', { consumerId: consumer.id, producerId, userId: ws.userId, channelId: ws.channelId });
+                            incCounter('sfu_consumer_closed_total');
+                        });
+                        consumer.on?.('producerclose', () => {
+                            logLifecycle('consumer-producer-closed', { consumerId: consumer.id, producerId, userId: ws.userId, channelId: ws.channelId });
+                            incCounter('sfu_consumer_producer_closed_total');
+                        });
                         if (!channelConsumers.get(ws.channelId).has(ws)) {
                             channelConsumers.get(ws.channelId).set(ws, new Map());
                         }
@@ -825,52 +952,120 @@ async function dspeakWebSocketHandler(ws, req) {
     });
 
     ws.on('close', () => {
-        console.log(`[ws] Client ${userId} disconnected from channel ${channelId}`);
-        clients.delete(ws);
-        // Remove from channel presence
-        if (channelPresence.has(channelId)) {
-            channelPresence.get(channelId).delete(userId);
-            if (channelPresence.get(channelId).size === 0) {
-                channelPresence.delete(channelId);
+        // Stage disconnect with grace period so clients can reconnect without full teardown
+        logLifecycle('ws-close-received', { userId, channelId });
+        stageDisconnect(ws, 'client-close');
+    });
+
+    // Graceful staging: keep resources for a short window to allow resume
+    function stageDisconnect(targetWs, reason) {
+        try {
+            const key = `${targetWs.channelId}:${targetWs.userId}`;
+            if (stagedParticipants.has(key)) {
+                // Already staged; reset timer
+                const entry = stagedParticipants.get(key);
+                clearTimeout(entry.timer);
+                entry.ts = Date.now();
+                entry.reason = reason;
+                entry.timer = setTimeout(() => finalizeDisconnect(key), GRACE_MS);
+                logLifecycle('stage-refresh', { key, reason, graceMs: GRACE_MS });
+                return;
             }
-        }
-        // Notify main server of leave event
-        sendInteropEvent({
-            type: 'media_presence',
-            event: 'leave',
-            userId,
-            channelId,
-            timestamp: new Date().toISOString()
-        });
-        // Cleanup transports, producers, consumers
-        if (channelTransports.has(channelId)) {
-            const wsTransports = channelTransports.get(channelId).get(ws);
-            if (wsTransports) {
-                for (const transport of wsTransports.values()) {
-                    if (typeof transport?.close === 'function') {
-                        try {
-                            transport.close();
-                        } catch (err) {
-                            console.warn('[mediasoup] Error closing transport:', err);
-                        }
+
+            // Capture current resources
+            const transports = channelTransports.has(targetWs.channelId) ? channelTransports.get(targetWs.channelId).get(targetWs) : null;
+            const producer = channelProducers.has(targetWs.channelId) ? channelProducers.get(targetWs.channelId).get(targetWs) : null;
+            const consumers = channelConsumers.has(targetWs.channelId) ? channelConsumers.get(targetWs.channelId).get(targetWs) : null;
+
+            // Remove from active client list and presence immediately
+            clients.delete(targetWs);
+            if (channelPresence.has(targetWs.channelId)) {
+                channelPresence.get(targetWs.channelId).delete(targetWs.userId);
+                // broadcast presence
+                for (const client of clients) {
+                    if (client.channelId === targetWs.channelId) {
+                        client.send(JSON.stringify({ type: 'currentlyInChannel', inRoom: Array.from(channelPresence.get(targetWs.channelId)) }));
                     }
                 }
-                channelTransports.get(channelId).delete(ws);
             }
+
+            const timer = setTimeout(() => finalizeDisconnect(key), GRACE_MS);
+            stagedParticipants.set(key, { transports, producer, consumers, timer, ts: Date.now(), reason });
+            logLifecycle('stage-created', { key, reason, graceMs: GRACE_MS });
+            incCounter('sfu_stage_created_total');
+
+            // Notify interop server of staged leave
+            sendInteropEvent({ type: 'media_presence', event: 'staged-leave', userId: targetWs.userId, channelId: targetWs.channelId, reason, timestamp: new Date().toISOString() });
+        } catch (e) {
+            console.warn('[SFU] stageDisconnect error:', e && e.message ? e.message : e);
+            // Fallback to immediate finalization
+            finalizeDisconnect(`${ws.channelId}:${ws.userId}`);
         }
-        if (channelProducers.has(channelId)) {
-            const pmap = channelProducers.get(channelId);
-            const producer = pmap.get(ws);
-            if (producer) {
-                producer.close();
-                // Remove mapping and notify clients
-                if (channelProducerUserMap.has(ws.channelId)) {
-                    channelProducerUserMap.get(ws.channelId).delete(producer.id);
+    }
+
+    function finalizeDisconnect(key) {
+        try {
+            const entry = stagedParticipants.get(key);
+            if (!entry) return;
+            const [channelId, userId] = key.split(':');
+            // Close transports
+            if (entry.transports) {
+                for (const transport of entry.transports.values()) {
+                    try { transport.close(); } catch (e) {}
+                    logLifecycle('transport-closed', { transportId: transport.id, userId, channelId, reason: entry.reason });
                 }
-                pmap.delete(ws);
             }
+            // Close producer
+            if (entry.producer) {
+                try { entry.producer.close(); } catch (e) {}
+                logLifecycle('producer-closed', { producerId: entry.producer.id, userId, channelId, reason: entry.reason });
+                if (channelProducerUserMap.has(channelId)) channelProducerUserMap.get(channelId).delete(entry.producer.id);
+            }
+            // Consumers cleanup
+            if (entry.consumers) {
+                for (const consumer of entry.consumers.values()) {
+                    try { consumer.close(); } catch (e) {}
+                    logLifecycle('consumer-closed', { consumerId: consumer.id, userId, channelId, reason: entry.reason });
+                }
+            }
+
+            stagedParticipants.delete(key);
+            incCounter('sfu_finalized_disconnect_total');
+            // Notify interop server of final leave
+            sendInteropEvent({ type: 'media_presence', event: 'leave', userId, channelId, reason: entry.reason, timestamp: new Date().toISOString() });
+        } catch (e) {
+            console.warn('[SFU] finalizeDisconnect error:', e && e.message ? e.message : e);
         }
-    });
+    }
+
+    // Allow restoration if client reconnects with same userId/channelId within grace window
+    function restoreIfStaged(newWs) {
+        const key = `${newWs.channelId}:${newWs.userId}`;
+        const entry = stagedParticipants.get(key);
+        if (!entry) return false;
+        clearTimeout(entry.timer);
+        // Reattach maps
+        if (!channelTransports.has(newWs.channelId)) channelTransports.set(newWs.channelId, new Map());
+        if (entry.transports) channelTransports.get(newWs.channelId).set(newWs, entry.transports);
+        if (!channelProducers.has(newWs.channelId)) channelProducers.set(newWs.channelId, new Map());
+        if (entry.producer) channelProducers.get(newWs.channelId).set(newWs, entry.producer);
+        if (entry.consumers) {
+            if (!channelConsumers.has(newWs.channelId)) channelConsumers.set(newWs.channelId, new Map());
+            channelConsumers.get(newWs.channelId).set(newWs, entry.consumers);
+        }
+        stagedParticipants.delete(key);
+        logLifecycle('stage-restored', { key });
+        incCounter('sfu_stage_restored_total');
+        // record reconnection time
+        try {
+            const reconnectMs = Date.now() - (entry.ts || Date.now());
+            incCounter('sfu_reconnect_total');
+            setGauge('sfu_last_reconnect_ms', reconnectMs);
+        } catch (e) {}
+        // Notify interop server of re-join
+        sendInteropEvent({ type: 'media_presence', event: 'rejoin', userId: newWs.userId, channelId: newWs.channelId, timestamp: new Date().toISOString() });
+        return true;
+    }
 }
 
 export {dspeakWebSocketHandler}
